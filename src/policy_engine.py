@@ -1,10 +1,27 @@
 """
-Agent Guardrail — Month 1 core.
+Agent Guardrail — generalized policy engine.
 
-A tiny mock API that stands in for a real backend (CRM, email, etc).
-Point your AI agent at this instead of production, and it will get
-a 200 or 403 back depending on the synthetic user's policy — with
-every decision written to audit.jsonl.
+Instead of one Python endpoint per resource, this exposes a single dynamic
+route: /api/{resource}/{user_id}/{action}
+
+The resource and action names are whatever you define in policy.json — no
+code changes needed to model a new API. Point your agent at this instead
+of production, and it gets a 200 or 403 back based on the synthetic user's
+policy, with every decision logged to audit.jsonl.
+
+Example policy.json:
+    {
+      "synthetic_users": {
+        "alice": { "emails": { "read": true, "delete": false } },
+        "bob":   { "emails": { "read": false, "delete": false } }
+      }
+    }
+
+Example calls:
+    GET    /api/emails/alice/read     -> 200 (allowed)
+    GET    /api/emails/bob/read       -> 403 (denied)
+    DELETE /api/emails/alice/delete   -> 403 (denied)
+    GET    /api/emails/charlie/read   -> 404 (no such synthetic user)
 
 Run:
     uvicorn policy_engine:app --reload --port 8080
@@ -17,7 +34,7 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="Agent Guardrail")
@@ -45,64 +62,59 @@ def load_policy() -> dict:
         return json.load(f)
 
 
-def log_decision(agent_id: str, user_id: str, action: str, decision: str) -> None:
+def log_decision(agent_id: str, user_id: str, resource: str, action: str, decision: str) -> None:
     entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "agent": agent_id,
         "user": user_id,
+        "resource": resource,
         "action": action,
         "decision": decision,
     }
-    # Defensive: not strictly needed while handlers stay async-def-with-no-await
-    # (uvicorn's single event loop serializes them), but this is what protects
-    # you the moment you add real async I/O or run with --workers > 1 per process.
     with _audit_lock:
         with open(AUDIT_LOG_PATH, "a") as f:
             f.write(json.dumps(entry) + "\n")
     print(f"{'✅ ALLOW' if decision == 'ALLOW' else '🚫 DENY'}: "
-          f"agent={agent_id} user={user_id} action={action}")
+          f"agent={agent_id} user={user_id} resource={resource} action={action}")
 
 
-def check_permission(user_id: str, permission_key: str) -> tuple[bool, dict | None]:
-    """Returns (is_allowed, user_policy). user_policy is None if the user doesn't exist."""
+def check_permission(user_id: str, resource: str, action: str) -> tuple[bool, dict | None]:
+    """
+    Returns (is_allowed, user_policy).
+    user_policy is None if the synthetic user doesn't exist in policy.json.
+    Unknown resources/actions for a known user default to DENY (fail-closed).
+    """
     policy = load_policy()
     user_policy = policy["synthetic_users"].get(user_id)
     if user_policy is None:
         return False, None
-    return user_policy.get(permission_key, False), user_policy
+    resource_policy = user_policy.get(resource, {})
+    allowed = resource_policy.get(action, False)
+    return allowed, user_policy
 
 
-@app.get("/api/users/{user_id}/emails")
-async def read_emails(user_id: str, agent_id: str = "unknown"):
-    allowed, user_policy = check_permission(user_id, "can_read_emails")
+@app.api_route("/api/{resource}/{user_id}/{action}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+async def check_and_simulate(resource: str, user_id: str, action: str, request: Request):
+    agent_id = request.query_params.get("agent_id", "unknown")
 
-    if user_policy is None:
-        raise HTTPException(status_code=404, detail=f"No such synthetic user: {user_id}")
-
-    decision = "ALLOW" if allowed else "DENY"
-    log_decision(agent_id, user_id, "read_emails", decision)
-
-    if not allowed:
-        raise HTTPException(status_code=403, detail="Access denied by sandbox policy")
-
-    # Fake data — never real user data
-    return {"user": user_id, "emails": ["hello@example.com", "invoice@example.com"]}
-
-
-@app.delete("/api/users/{user_id}/records")
-async def delete_records(user_id: str, agent_id: str = "unknown"):
-    allowed, user_policy = check_permission(user_id, "can_delete_records")
+    allowed, user_policy = check_permission(user_id, resource, action)
 
     if user_policy is None:
         raise HTTPException(status_code=404, detail=f"No such synthetic user: {user_id}")
 
     decision = "ALLOW" if allowed else "DENY"
-    log_decision(agent_id, user_id, "delete_records", decision)
+    log_decision(agent_id, user_id, resource, action, decision)
 
     if not allowed:
         raise HTTPException(status_code=403, detail="Access denied by sandbox policy")
 
-    return {"user": user_id, "status": "records deleted (simulated)"}
+    # Simulated success — never real data, just proof the call was authorized
+    return {
+        "user": user_id,
+        "resource": resource,
+        "action": action,
+        "status": "simulated success",
+    }
 
 
 @app.get("/healthz")

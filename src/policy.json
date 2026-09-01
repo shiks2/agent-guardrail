@@ -1,12 +1,14 @@
 {
   "synthetic_users": {
     "alice": {
-      "can_read_emails": true,
-      "can_delete_records": false
+      "emails": { "read": true, "delete": false },
+      "records": { "read": true, "delete": false },
+      "calendar": { "read": true, "write": true }
     },
     "bob": {
-      "can_read_emails": false,
-      "can_delete_records": false
+      "emails": { "read": false, "delete": false },
+      "records": { "read": false, "delete": false },
+      "calendar": { "read": true, "write": false }
     }
   }
 }
