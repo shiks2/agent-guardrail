@@ -1,0 +1,12 @@
+{
+  "synthetic_users": {
+    "alice": {
+      "can_read_emails": true,
+      "can_delete_records": false
+    },
+    "bob": {
+      "can_read_emails": false,
+      "can_delete_records": false
+    }
+  }
+}
