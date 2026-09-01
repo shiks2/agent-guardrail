@@ -1,4 +1,4 @@
-# 🛡️ agent-guardrail
+#  agent-guardrail
 
 **Test whether your AI agent respects permission boundaries — before it touches real data.**
 
