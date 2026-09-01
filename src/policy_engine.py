@@ -8,18 +8,35 @@ every decision written to audit.jsonl.
 
 Run:
     uvicorn policy_engine:app --reload --port 8080
+    AGENT_GUARDRAIL_PORT=9000 uvicorn policy_engine:app --port $AGENT_GUARDRAIL_PORT
 """
 
 import json
+import os
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="Agent Guardrail")
 
+# CORS: harmless to enable, but only matters if a browser calls this API
+# directly via fetch/XHR. Server-side agent frameworks (LangChain, CrewAI,
+# raw requests/httpx) never hit CORS — it's a browser-only mechanism.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # local dev tool only — never do this in production
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 POLICY_PATH = Path(__file__).parent / "policy.json"
 AUDIT_LOG_PATH = Path(__file__).parent / "audit.jsonl"
+PORT = int(os.getenv("AGENT_GUARDRAIL_PORT", 8080))
+
+_audit_lock = threading.Lock()
 
 
 def load_policy() -> dict:
@@ -36,8 +53,12 @@ def log_decision(agent_id: str, user_id: str, action: str, decision: str) -> Non
         "action": action,
         "decision": decision,
     }
-    with open(AUDIT_LOG_PATH, "a") as f:
-        f.write(json.dumps(entry) + "\n")
+    # Defensive: not strictly needed while handlers stay async-def-with-no-await
+    # (uvicorn's single event loop serializes them), but this is what protects
+    # you the moment you add real async I/O or run with --workers > 1 per process.
+    with _audit_lock:
+        with open(AUDIT_LOG_PATH, "a") as f:
+            f.write(json.dumps(entry) + "\n")
     print(f"{'✅ ALLOW' if decision == 'ALLOW' else '🚫 DENY'}: "
           f"agent={agent_id} user={user_id} action={action}")
 
@@ -87,3 +108,8 @@ async def delete_records(user_id: str, agent_id: str = "unknown"):
 @app.get("/healthz")
 async def healthz():
     return {"status": "ok"}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
