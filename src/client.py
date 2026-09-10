@@ -1,13 +1,10 @@
 """
-Zero-dependency Python Client SDK for Agent Guardrail.
-Provides a lightweight client to check permissions and assert boundary compliance.
+Python Client SDK for Agent Guardrail powered by httpx.
 """
 
-import json
-import urllib.error
-import urllib.request
 from dataclasses import dataclass
 from typing import Any
+import httpx
 
 
 @dataclass
@@ -23,7 +20,7 @@ class GuardrailResponse:
 
 
 class GuardrailClient:
-    """Client for querying Agent Guardrail mock server."""
+    """Client for evaluating permissions against Agent Guardrail."""
 
     def __init__(
         self,
@@ -33,7 +30,11 @@ class GuardrailClient:
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.agent_id = agent_id
-        self.timeout = timeout
+        self.client = httpx.Client(
+            base_url=self.base_url,
+            timeout=timeout,
+            headers={"X-Agent-Id": agent_id},
+        )
 
     def check(
         self,
@@ -42,55 +43,27 @@ class GuardrailClient:
         action: str,
         method: str = "GET",
     ) -> GuardrailResponse:
-        """
-        Evaluate permission for an action on a resource for a user.
-        Returns a GuardrailResponse object indicating whether the action is allowed.
-        """
-        url = f"{self.base_url}/api/{resource}/{user_id}/{action}"
-        headers = {
-            "X-Agent-Id": self.agent_id,
-            "User-Agent": f"AgentGuardrailClient/{self.agent_id}",
-        }
-        req = urllib.request.Request(url, method=method.upper(), headers=headers)
-
+        """Evaluate permission for an action on a resource for a user."""
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as response:
-                status_code = response.status
-                body = response.read().decode("utf-8")
-                data = json.loads(body) if body else {}
-                return GuardrailResponse(
-                    status_code=status_code,
-                    allowed=True,
-                    user=data.get("user", user_id),
-                    resource=data.get("resource", resource),
-                    action=data.get("action", action),
-                    detail=data.get("status"),
-                    raw=data,
-                )
-        except urllib.error.HTTPError as e:
-            status_code = e.code
-            body = e.read().decode("utf-8")
-            try:
-                data = json.loads(body) if body else {}
-            except json.JSONDecodeError:
-                data = {"detail": body}
+            r = self.client.request(method.upper(), f"/api/{resource}/{user_id}/{action}")
+            data = r.json() if r.content else {}
             return GuardrailResponse(
-                status_code=status_code,
-                allowed=False,
-                user=user_id,
-                resource=resource,
-                action=action,
-                detail=data.get("detail", str(e)),
+                status_code=r.status_code,
+                allowed=r.is_success,
+                user=data.get("user", user_id),
+                resource=data.get("resource", resource),
+                action=data.get("action", action),
+                detail=data.get("status") if r.is_success else data.get("detail", r.text),
                 raw=data,
             )
-        except urllib.error.URLError as e:
+        except httpx.HTTPError as e:
             return GuardrailResponse(
                 status_code=0,
                 allowed=False,
                 user=user_id,
                 resource=resource,
                 action=action,
-                detail=f"Connection failed: {e.reason}",
+                detail=f"Connection failed: {e}",
                 raw={},
             )
 
@@ -101,7 +74,7 @@ class GuardrailClient:
         action: str,
         method: str = "GET",
     ) -> GuardrailResponse:
-        """Check permission and raise AssertionError if the action is not allowed (status != 200)."""
+        """Check permission and raise AssertionError if the action is not allowed."""
         res = self.check(user_id, resource, action, method=method)
         if not res.allowed:
             raise AssertionError(
@@ -117,7 +90,7 @@ class GuardrailClient:
         action: str,
         method: str = "GET",
     ) -> GuardrailResponse:
-        """Check permission and raise AssertionError if the action is allowed (status == 200)."""
+        """Check permission and raise AssertionError if the action is allowed."""
         res = self.check(user_id, resource, action, method=method)
         if res.allowed:
             raise AssertionError(

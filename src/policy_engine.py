@@ -34,7 +34,6 @@ from policy import (
     HTTP_VERBS,
     PolicyError,
     action_methods_for,
-    require_bool,
     validate_policy,
     load_policy as _load_policy,
 )
@@ -152,24 +151,10 @@ def check_and_simulate(resource: str, user_id: str, action: str, request: Reques
     agent_id = clean_agent_id(request)
     method = request.method.upper()
 
-    try:
-        policy = load_policy()
-        allowed, user_policy, reason = check_permission(
-            user_id, resource, action, policy, method=method
-        )
-    except PolicyError as e:
-        log_decision(
-            agent_id,
-            user_id,
-            resource,
-            action,
-            "DENY",
-            reason=f"POLICY_ERROR: {e}",
-            method=method,
-        )
-        raise HTTPException(
-            status_code=503, detail="Guardrail policy is invalid; see audit.jsonl"
-        )
+    policy = load_policy()
+    allowed, user_policy, reason = check_permission(
+        user_id, resource, action, policy, method=method
+    )
 
     decision = "ALLOW" if allowed else "DENY"
     # Log every outcome, including unknown-user 404, before raising.

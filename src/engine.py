@@ -1,8 +1,9 @@
 """
-Core policy permission evaluation engine.
+Core authorization decision engine.
+Evaluates permissions against validated policy configuration and HTTP methods.
 """
 
-from policy import require_bool, action_methods_for
+from policy import action_methods_for
 
 
 def check_permission(
@@ -11,28 +12,20 @@ def check_permission(
     """
     Evaluates policy permission for a given user, resource, and action.
     Returns (is_allowed, user_policy, reason).
-    
-    Reason codes:
-    - POLICY_ALLOW: Request permitted by policy and method matches.
-    - POLICY_DENY: Action exists for user/resource but boolean value is False.
-    - UNKNOWN_USER: User not found in synthetic_users.
-    - UNKNOWN_RESOURCE: Resource not found in user's permissions.
-    - UNKNOWN_ACTION: Action not found in resource's permissions.
-    - UNBOUND_ACTION: Action is not bound to any HTTP method.
-    - METHOD_MISMATCH: HTTP method does not match allowed methods for this action.
     """
-    user_policy = policy.get("synthetic_users", {}).get(user_id)
+    users = policy.get("synthetic_users", {})
+    user_policy = users.get(user_id)
     if user_policy is None:
         return False, None, "UNKNOWN_USER"
+
     resource_policy = user_policy.get(resource)
     if resource_policy is None:
         return False, user_policy, "UNKNOWN_RESOURCE"
+
     if action not in resource_policy:
         return False, user_policy, "UNKNOWN_ACTION"
-    allowed = require_bool(
-        resource_policy[action], f"synthetic_users[{user_id!r}][{resource!r}][{action!r}]"
-    )
-    if not allowed:
+
+    if not resource_policy[action]:
         return False, user_policy, "POLICY_DENY"
 
     # Enforce method-action binding (P0-3 / F2)

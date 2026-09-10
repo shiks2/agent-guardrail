@@ -4,39 +4,56 @@
 
 ```
 agent-guardrail/
-├── Dockerfile                  # Container definition for containerized execution
-├── README.md                   # Project overview, quickstart, examples, and roadmap
-├── requirements.txt            # Python dependencies (FastAPI, Uvicorn, Pydantic, python-dotenv)
+├── Dockerfile                  # Hardened container definition (non-root, healthcheck, volume)
+├── LICENSE                     # MIT License
+├── README.md                   # Project overview, SDK usage, examples, and roadmap
+├── pyproject.toml              # Build & tool configuration (pythonpath, pyright)
+├── requirements.txt            # Production dependencies (FastAPI, Uvicorn, Pydantic)
+├── requirements-dev.txt        # Development dependencies (pytest, httpx)
+├── .dockerignore               # Container build ignore rules
+├── .github/workflows/ci.yml    # GitHub Actions matrix CI workflow
+├── examples/
+│   ├── langchain_guardrail.py      # LangChain tool integration example
+│   ├── crewai_guardrail.py         # CrewAI multi-agent role attribution example
+│   └── test_agent_boundary_eval.py # Pytest CI boundary evaluation recipe
 ├── src/
 │   ├── __init__.py             # Python package marker
+│   ├── models.py               # Pydantic schemas (PolicyModel with StrictBool, AuditRecord)
+│   ├── policy.py               # Policy loading, JSON parsing, and action-method resolution
+│   ├── audit.py                # Audit logging and size-based rotation (RotatingFileHandler)
+│   ├── engine.py               # Pure permission decision engine
+│   ├── cli.py                  # Zero-dependency report & CI gate CLI
+│   ├── client.py               # Zero-dependency Python Client SDK (GuardrailClient)
 │   ├── policy.json             # Synthetic user policy definitions
-│   └── policy_engine.py        # Core application, policy validation, and audit logger
+│   └── policy_engine.py        # FastAPI app, synchronous threadpool routes, exception safety net
 └── tests/
     ├── policy_test_utils.py    # Test fixtures and shared testing utilities
     ├── test_agent_id.py        # Regression suite: Agent ID bounding and sanitization
-    ├── test_audit_reasons.py   # Regression suite: Audit reasons, HTTP method recording, error traces
-    └── test_policy_validation.py # Regression suite: Boolean validation, fail-closed 503 behavior
+    ├── test_audit_reasons.py   # Regression suite: Audit reasons, HTTP method binding
+    ├── test_policy_validation.py # Regression suite: Pydantic StrictBool validation, 503 fail-closed
+    ├── test_cli.py             # CLI reporting, JSON output, and rotation tests
+    └── test_client.py          # Python Client SDK tests
 ```
 
 ## Module Responsibilities
 
-### `src/policy_engine.py`
-- **Application Setup**: Initializes FastAPI app, CORS middleware, and environment variables.
-- **Exceptions**: Defines `PolicyError` exception class for invalid configuration states.
-- **Validation**:
-  - `_require_bool(value, path)`: Enforces that policy leaves are genuine JSON booleans (`type(value) is bool`).
-  - `validate_policy(doc)`: Validates nested structure (`synthetic_users -> user -> resource -> action -> bool`).
-- **Engine Logic**:
-  - `load_policy()`: Loads and parses `policy.json`.
-  - `check_permission(user_id, resource, action, policy)`: Evaluates allow/deny status and assigns reason codes (`POLICY_ALLOW`, `POLICY_DENY`, `UNKNOWN_USER`, `UNKNOWN_RESOURCE`, `UNKNOWN_ACTION`).
-  - `clean_agent_id(request)`: Extracts, bounds (128 chars), and sanitizes agent identifiers.
-  - `log_decision(...)`: Thread-safe file writer for `audit.jsonl` and console logger.
-- **Endpoints**:
-  - `/api/{resource}/{user_id}/{action}`: Dynamic route handler.
-  - `/healthz`: Health check probe.
+### `src/models.py`
+- **Domain Schemas**: Defines `PolicyModel` with `StrictBool` validation to prevent truthiness bypasses. Defines `AuditRecord` for standardized audit logs.
 
-### `tests/`
-- **`policy_test_utils.py`**: Provides the `env` pytest fixture (mocking `POLICY_PATH` and `AUDIT_LOG_PATH` in a temporary directory), helper functions `audit(env)` and `set_policy(env, doc)`.
-- **`test_policy_validation.py`**: Verifies exact boolean handling (rejecting strings `"false"`, `0`, `None`), 503 error handling on malformed JSON, and `/healthz` reporting.
-- **`test_audit_reasons.py`**: Verifies audit trails for all decisions, reasons, and method auditing.
-- **`test_agent_id.py`**: Verifies bounding, control-character stripping, and header extraction for agent IDs.
+### `src/policy.py`
+- **Configuration & Resolution**: Loads JSON files, validates against `PolicyModel`, and resolves action-to-HTTP-method bindings (`action_methods_for`).
+
+### `src/audit.py`
+- **Audit Pipeline**: Uses Python standard library `RotatingFileHandler` to log immutable, machine-readable JSON lines with bounded size and backups. Sanitizes caller-supplied `X-Agent-Id` headers.
+
+### `src/engine.py`
+- **Authorization Engine**: Evaluates permissions and returns `(is_allowed, user_policy, reason)` with strict fail-closed codes.
+
+### `src/cli.py`
+- **CLI & CI Gate**: Analyzes audit logs, formats summary tables, outputs JSON, and exits with non-zero code on `--fail-on-deny`.
+
+### `src/client.py`
+- **SDK**: Zero-dependency `GuardrailClient` for Python applications and evaluation test suites.
+
+### `src/policy_engine.py`
+- **Web API**: FastAPI application routing dynamic requests (`/api/{resource}/{user_id}/{action}`) and health checks (`/healthz`) to worker threads with a global exception safety net.
