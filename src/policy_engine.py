@@ -34,6 +34,7 @@ Run:
 
 import json
 import os
+import re
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -56,6 +57,10 @@ app.add_middleware(
 POLICY_PATH = Path(__file__).parent / "policy.json"
 AUDIT_LOG_PATH = Path(__file__).parent / "audit.jsonl"
 PORT = int(os.getenv("AGENT_GUARDRAIL_PORT", 8080))
+
+# Caller-supplied attribution is advisory; keep it bounded and printable.
+MAX_AGENT_ID_LEN = 128
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 
 _audit_lock = threading.Lock()
 
@@ -159,9 +164,15 @@ def check_permission(
     return allowed, user_policy, "POLICY_ALLOW" if allowed else "POLICY_DENY"
 
 
+def clean_agent_id(request: Request) -> str:
+    """Bound and sanitize caller-supplied attribution; prefer the X-Agent-Id header."""
+    raw = request.headers.get("x-agent-id") or request.query_params.get("agent_id") or "unknown"
+    return _CONTROL_CHARS.sub("", raw)[:MAX_AGENT_ID_LEN] or "unknown"
+
+
 @app.api_route("/api/{resource}/{user_id}/{action}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 async def check_and_simulate(resource: str, user_id: str, action: str, request: Request):
-    agent_id = request.query_params.get("agent_id", "unknown")
+    agent_id = clean_agent_id(request)
     method = request.method.upper()
 
     # A broken policy denies everything loudly instead of returning a bare 500.
