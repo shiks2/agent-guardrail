@@ -108,55 +108,81 @@ def load_policy() -> dict:
     return validate_policy(doc)
 
 
-def log_decision(agent_id: str, user_id: str, resource: str, action: str, decision: str) -> None:
+def log_decision(
+    agent_id: str,
+    user_id: str,
+    resource: str,
+    action: str,
+    decision: str,
+    *,
+    reason: str,
+    method: str,
+) -> None:
     entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "agent": agent_id,
         "user": user_id,
         "resource": resource,
         "action": action,
+        "method": method,
         "decision": decision,
+        "reason": reason,
     }
     with _audit_lock:
         with open(AUDIT_LOG_PATH, "a") as f:
             f.write(json.dumps(entry) + "\n")
     print(f"{'✅ ALLOW' if decision == 'ALLOW' else '🚫 DENY'}: "
-          f"agent={agent_id} user={user_id} resource={resource} action={action}")
+          f"agent={agent_id} user={user_id} resource={resource} action={action} "
+          f"method={method} reason={reason}")
 
 
-def check_permission(user_id: str, resource: str, action: str) -> tuple[bool, dict | None]:
+def check_permission(
+    user_id: str, resource: str, action: str, policy: dict
+) -> tuple[bool, dict | None, str]:
     """
-    Returns (is_allowed, user_policy).
+    Returns (is_allowed, user_policy, reason).
     user_policy is None if the synthetic user doesn't exist in policy.json.
     Unknown resources/actions for a known user default to DENY (fail-closed).
+    `reason` is a stable, machine-readable code for the audit log.
     """
-    policy = load_policy()
     user_policy = policy["synthetic_users"].get(user_id)
     if user_policy is None:
-        return False, None
-    resource_policy = user_policy.get(resource, {})
-    allowed = resource_policy.get(action, False)
-    return allowed, user_policy
+        return False, None, "UNKNOWN_USER"
+    resource_policy = user_policy.get(resource)
+    if resource_policy is None:
+        return False, user_policy, "UNKNOWN_RESOURCE"
+    if action not in resource_policy:
+        return False, user_policy, "UNKNOWN_ACTION"
+    allowed = _require_bool(
+        resource_policy[action], f"synthetic_users[{user_id!r}][{resource!r}][{action!r}]"
+    )
+    return allowed, user_policy, "POLICY_ALLOW" if allowed else "POLICY_DENY"
 
 
 @app.api_route("/api/{resource}/{user_id}/{action}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 async def check_and_simulate(resource: str, user_id: str, action: str, request: Request):
     agent_id = request.query_params.get("agent_id", "unknown")
+    method = request.method.upper()
 
     # A broken policy denies everything loudly instead of returning a bare 500.
     try:
-        allowed, user_policy = check_permission(user_id, resource, action)
-    except PolicyError:
-        log_decision(agent_id, user_id, resource, action, "DENY")
+        policy = load_policy()
+        allowed, user_policy, reason = check_permission(user_id, resource, action, policy)
+    except PolicyError as e:
+        log_decision(
+            agent_id, user_id, resource, action, "DENY",
+            reason=f"POLICY_ERROR: {e}", method=method,
+        )
         raise HTTPException(
             status_code=503, detail="Guardrail policy is invalid; see audit.jsonl"
         )
 
+    decision = "ALLOW" if allowed else "DENY"
+    # Log every outcome, including the unknown-user 404 below, before raising.
+    log_decision(agent_id, user_id, resource, action, decision, reason=reason, method=method)
+
     if user_policy is None:
         raise HTTPException(status_code=404, detail=f"No such synthetic user: {user_id}")
-
-    decision = "ALLOW" if allowed else "DENY"
-    log_decision(agent_id, user_id, resource, action, decision)
 
     if not allowed:
         raise HTTPException(status_code=403, detail="Access denied by sandbox policy")
