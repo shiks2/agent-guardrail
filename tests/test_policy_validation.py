@@ -6,7 +6,7 @@ Run: pytest tests/test_policy_validation.py
 """
 
 import pytest
-
+import policy_engine
 from policy_test_utils import audit, env, set_policy  # noqa: F401
 
 
@@ -67,3 +67,41 @@ def test_healthz_reports_policy_error(env):
     assert env.client.get("/healthz").json() == {"status": "ok"}
     set_policy(env, "{ broken")
     assert env.client.get("/healthz").json()["status"] == "policy_error"
+
+
+def test_unexpected_exception_is_audited_as_internal_error(env, monkeypatch):
+    """
+    P0-4 / F4: Any unexpected runtime failure returns 500 and is guaranteed to be audited.
+    """
+    def broken_check(*args, **kwargs):
+        raise RuntimeError("simulated unexpected crash")
+
+    monkeypatch.setattr(policy_engine, "check_permission", broken_check)
+    r = env.client.get("/api/emails/alice/read")
+    assert r.status_code == 500
+    assert r.json() == {"detail": "Internal server error; see audit.jsonl"}
+    line = audit(env)[-1]
+    assert line["decision"] == "DENY"
+    assert "INTERNAL_ERROR" in line["reason"]
+
+
+def test_policy_hot_reload_on_edit(env):
+    """
+    P1-1: Modifying policy.json immediately alters decisions on the next request.
+    """
+    # Initially alice can read emails
+    assert env.client.get("/api/emails/alice/read").status_code == 200
+
+    # Dynamically change policy to deny alice read
+    set_policy(
+        env,
+        {
+            "synthetic_users": {
+                "alice": {"emails": {"read": False}}
+            }
+        },
+    )
+    # Next request immediately receives 403 without restart
+    assert env.client.get("/api/emails/alice/read").status_code == 403
+
+

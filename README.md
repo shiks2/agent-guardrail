@@ -1,12 +1,14 @@
-#  agent-guardrail
+# agent-guardrail
 
 **Test whether your AI agent respects permission boundaries — before it touches real data.**
 
-If you're building an agent that eventually calls real APIs (read emails, delete records, touch a calendar), you don't want to find out it ignores a permission boundary in production. `agent-guardrail` is a tiny local mock server: point your agent at it instead of your real backend, define who's allowed to do what in a JSON file, and get a clean `200` or `403` back — with every decision logged.
+If you're building an agent that eventually calls real APIs (read emails, delete records, touch a calendar), you don't want to find out it ignores a permission boundary in production. `agent-guardrail` is a lightweight local mock server: point your agent at it instead of your real backend, define who's allowed to do what in a JSON file, and get a clean `200` or `403` back — with every decision logged to an immutable audit trail.
+
+---
 
 ## How it works
 
-Every resource and action is defined in `policy.json` — no code changes needed to model a new API:
+Every resource, action, and synthetic user permission is defined in `policy.json` — no code changes needed to model a new API:
 
 ```json
 {
@@ -25,7 +27,12 @@ Every resource and action is defined in `policy.json` — no code changes needed
 }
 ```
 
-Point your agent at `/api/{resource}/{user_id}/{action}` instead of your real API. The server checks the policy and responds accordingly. Anything not explicitly allowed is denied — unknown resources, unknown actions, and unknown users all fail closed.
+Point your agent at `/api/{resource}/{user_id}/{action}` instead of your real API. The server checks the policy and responds accordingly:
+- **Fail-closed guarantees**: Anything not explicitly permitted is denied. Unknown resources, unknown actions, and unknown users all fail closed.
+- **Strict boolean validation**: Policy leaves must be native JSON booleans (`true`/`false`). Coerced strings (e.g. `"false"`) or malformed configs fail closed with a `503`.
+- **Method-to-action binding**: Actions bind to standard HTTP verbs (`read` -> `GET`, `write` -> `POST`/`PUT`, `delete` -> `DELETE`, or verbs directly). Mismatched methods return `403 METHOD_MISMATCH`.
+
+---
 
 ## Quick start
 
@@ -36,7 +43,7 @@ pip install -r requirements.txt
 cd src && uvicorn policy_engine:app --reload --port 8080
 ```
 
-Try it — these are real, verified responses from a running instance:
+Try it — verified responses from a running instance:
 
 ```bash
 $ curl "http://127.0.0.1:8080/api/emails/alice/read?agent_id=test-bot"
@@ -52,44 +59,90 @@ $ curl "http://127.0.0.1:8080/api/calendar/bob/read?agent_id=test-bot"
 {"user":"bob","resource":"calendar","action":"read","status":"simulated success"}
 ```
 
-Every call above is logged to `audit.jsonl`:
+Every call above is logged to `audit.jsonl` with an explicit reason code:
 
 ```json
-{"timestamp": "2026-09-01T07:07:58Z", "agent": "test-bot", "user": "alice", "resource": "emails", "action": "read", "decision": "ALLOW"}
-{"timestamp": "2026-09-01T07:07:58Z", "agent": "test-bot", "user": "bob", "resource": "emails", "action": "read", "decision": "DENY"}
+{"timestamp": "2026-09-10T14:30:00Z", "agent": "test-bot", "user": "alice", "resource": "emails", "action": "read", "method": "GET", "decision": "ALLOW", "reason": "POLICY_ALLOW"}
+{"timestamp": "2026-09-10T14:30:00Z", "agent": "test-bot", "user": "bob", "resource": "emails", "action": "read", "method": "GET", "decision": "DENY", "reason": "POLICY_DENY"}
 ```
 
-## Model your own API
+---
 
-Edit `policy.json` — add whatever resources and actions match your real API's shape (`files`, `crm_contacts`, `payments`, anything). No Python changes required.
+## Audit Trail Reporting & CI Integration
 
-```json
-{
-  "synthetic_users": {
-    "charlie": {
-      "files": { "read": true, "delete": false }
-    }
-  }
-}
-```
+Inspect and summarize all recorded decisions using the built-in CLI:
 
 ```bash
-curl "http://127.0.0.1:8080/api/files/charlie/read"     # 200
-curl -X DELETE "http://127.0.0.1:8080/api/files/charlie/delete"  # 403
+# Print a human-readable audit report
+python src/cli.py report --audit src/audit.jsonl
+
+# Output structured JSON for automation
+python src/cli.py report --json
+
+# Fail CI build if any unauthorized (DENY) attempts occurred
+python src/cli.py report --fail-on-deny
 ```
+
+---
+
+## Docker Support
+
+Run with zero setup via Docker (hardened non-root user with health check and persistent volume):
+
+```bash
+docker build -t agent-guardrail .
+docker run -p 8080:8080 -v guardrail-data:/app/src agent-guardrail
+```
+
+---
+
+## Python Client SDK & Framework Integrations
+
+Agent Guardrail includes a zero-dependency Python client (`GuardrailClient`) in `src/client.py`:
+
+```python
+from client import GuardrailClient
+
+client = GuardrailClient(base_url="http://127.0.0.1:8080", agent_id="my-agent-v1")
+
+# Check permissions
+response = client.check(user_id="alice", resource="emails", action="read")
+if response.allowed:
+    print("Action authorized:", response.detail)
+else:
+    print("Action blocked:", response.detail)
+
+# CI Assertion Helpers
+client.assert_allowed("alice", "emails", "read")
+client.assert_denied("bob", "emails", "read")
+```
+
+### Reference Examples
+- [LangChain Custom Tool Wrapper](file:///c:/Users/ratho/OneDrive/Desktop/sachin/ai/agent-guardrail/examples/langchain_guardrail.py)
+- [CrewAI / Multi-Agent Role Attribution](file:///c:/Users/ratho/OneDrive/Desktop/sachin/ai/agent-guardrail/examples/crewai_guardrail.py)
+- [Automated Agent Boundary Conformance CI Test](file:///c:/Users/ratho/OneDrive/Desktop/sachin/ai/agent-guardrail/examples/test_agent_boundary_eval.py)
+
+---
 
 ## Roadmap
 
 - [x] Generic, policy-driven ALLOW/DENY engine
-- [x] Audit logging (`audit.jsonl`)
+- [x] Audit logging with machine-readable reasons (`audit.jsonl`)
 - [x] Fail-closed on unknown resource/action/user
-- [ ] Docker image
-- [ ] GitHub Action for CI/CD (fail a PR if an agent attempts unauthorized access)
-- [ ] Example integration with LangChain / CrewAI
+- [x] Strict boolean type validation & fail-closed error handling
+- [x] HTTP Method ↔ Action binding with zero-config fallback
+- [x] Hardened Docker container
+- [x] Audit report CLI with `--fail-on-deny` CI gate
+- [x] Automated GitHub Actions CI workflow
+- [x] Example integration with LangChain / CrewAI & Python Client SDK
+
+---
 
 ## Contributing
 
-This is a solo-dev MVP — issues and PRs welcome, especially if you hit a real API shape it doesn't model well.
+Issues and PRs welcome! Please ensure all tests pass before submitting (`pytest -v`).
+
+---
 
 ## License
 

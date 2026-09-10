@@ -42,14 +42,79 @@ def test_one_audit_line_per_request(env):
     assert len(audit(env)) == 5
 
 
-def test_method_is_recorded_without_changing_the_decision(env):
+def test_method_mismatch_is_denied_and_audited(env):
     """
-    Decision semantics are intentionally unchanged: the action lives in the path and the
-    HTTP method is still not part of the check. The log now tells the truth about it.
+    F2 / P0-3 fix: Sending a DELETE request to a 'read' action is denied with METHOD_MISMATCH.
     """
     r = env.client.delete("/api/emails/alice/read", params={"agent_id": "x"})
-    assert r.status_code == 200  # preserved behavior, not a silent break
+    assert r.status_code == 403
     line = audit(env)[-1]
     assert line["method"] == "DELETE"
     assert line["action"] == "read"
-    assert line["decision"] == "ALLOW"
+    assert line["decision"] == "DENY"
+    assert line["reason"] == "METHOD_MISMATCH"
+
+
+def test_zero_config_verb_action(env):
+    """Actions named after standard HTTP verbs bind automatically without config."""
+    set_policy(
+        env,
+        {
+            "synthetic_users": {
+                "alice": {
+                    "records": {"delete": True, "post": True}
+                }
+            }
+        },
+    )
+    # DELETE on delete action -> allowed
+    r1 = env.client.delete("/api/records/alice/delete")
+    assert r1.status_code == 200
+    assert audit(env)[-1]["reason"] == "POLICY_ALLOW"
+
+    # GET on delete action -> method mismatch
+    r2 = env.client.get("/api/records/alice/delete")
+    assert r2.status_code == 403
+    assert audit(env)[-1]["reason"] == "METHOD_MISMATCH"
+
+
+def test_unbound_action_is_denied(env):
+    """An action that is not in defaults and not an HTTP verb fails closed with UNBOUND_ACTION."""
+    set_policy(
+        env,
+        {
+            "synthetic_users": {
+                "alice": {
+                    "documents": {"approve": True}
+                }
+            }
+        },
+    )
+    r = env.client.post("/api/documents/alice/approve")
+    assert r.status_code == 403
+    assert audit(env)[-1]["reason"] == "UNBOUND_ACTION"
+
+
+def test_custom_action_methods_in_policy(env):
+    """Custom action_methods declared in policy.json bind non-standard action names."""
+    set_policy(
+        env,
+        {
+            "action_methods": {
+                "approve": ["POST"]
+            },
+            "synthetic_users": {
+                "alice": {
+                    "documents": {"approve": True}
+                }
+            }
+        },
+    )
+    r_post = env.client.post("/api/documents/alice/approve")
+    assert r_post.status_code == 200
+    assert audit(env)[-1]["reason"] == "POLICY_ALLOW"
+
+    r_get = env.client.get("/api/documents/alice/approve")
+    assert r_get.status_code == 403
+    assert audit(env)[-1]["reason"] == "METHOD_MISMATCH"
+

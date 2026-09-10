@@ -9,108 +9,52 @@ code changes needed to model a new API. Point your agent at this instead
 of production, and it gets a 200 or 403 back based on the synthetic user's
 policy, with every decision logged to audit.jsonl.
 
-Policy values must be JSON booleans. A quoted `"false"` is rejected at load time
+Policy values must be JSON booleans. A quoted "false" is rejected at load time
 rather than silently treated as truthy, and an invalid policy fails closed with a
 503 instead of a 500.
-
-Example policy.json:
-    {
-      "synthetic_users": {
-        "alice": { "emails": { "read": true, "delete": false } },
-        "bob":   { "emails": { "read": false, "delete": false } }
-      }
-    }
 
 Example calls:
     GET    /api/emails/alice/read     -> 200 (allowed)
     GET    /api/emails/bob/read       -> 403 (denied)
     DELETE /api/emails/alice/delete   -> 403 (denied)
     GET    /api/emails/charlie/read   -> 404 (no such synthetic user)
-
-Run:
-    uvicorn policy_engine:app --reload --port 8080
-    AGENT_GUARDRAIL_PORT=9000 uvicorn policy_engine:app --port $AGENT_GUARDRAIL_PORT
 """
 
-import json
 import os
-import re
-import threading
-from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
-app = FastAPI(title="Agent Guardrail")
-
-# CORS: harmless to enable, but only matters if a browser calls this API
-# directly via fetch/XHR. Server-side agent frameworks (LangChain, CrewAI,
-# raw requests/httpx) never hit CORS — it's a browser-only mechanism.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # local dev tool only — never do this in production
-    allow_methods=["*"],
-    allow_headers=["*"],
+from policy import (
+    DEFAULT_POLICY_PATH,
+    DEFAULT_ACTION_METHODS,
+    HTTP_VERBS,
+    PolicyError,
+    action_methods_for,
+    require_bool,
+    validate_policy,
+    load_policy as _load_policy,
 )
+from audit import (
+    DEFAULT_AUDIT_LOG_PATH,
+    MAX_AGENT_ID_LEN,
+    clean_agent_id,
+    log_decision as _log_decision,
+)
+from engine import check_permission
 
-POLICY_PATH = Path(__file__).parent / "policy.json"
-AUDIT_LOG_PATH = Path(__file__).parent / "audit.jsonl"
+# Module-level paths for direct access and test monkeypatching
+POLICY_PATH: Path = DEFAULT_POLICY_PATH
+AUDIT_LOG_PATH: Path = DEFAULT_AUDIT_LOG_PATH
+HOST = os.getenv("AGENT_GUARDRAIL_HOST", "127.0.0.1")
 PORT = int(os.getenv("AGENT_GUARDRAIL_PORT", 8080))
 
-# Caller-supplied attribution is advisory; keep it bounded and printable.
-MAX_AGENT_ID_LEN = 128
-_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 
-_audit_lock = threading.Lock()
-
-
-class PolicyError(Exception):
-    """policy.json is structurally invalid. Requests fail closed (503), never allow."""
-
-
-def _require_bool(value: object, path: str) -> bool:
-    """Accept only real JSON booleans. bool subclasses int, hence the exact check."""
-    if type(value) is not bool:
-        raise PolicyError(
-            f"{path} must be a JSON boolean (true/false), got {type(value).__name__}={value!r}"
-        )
-    return value
-
-
-def validate_policy(doc: object) -> dict:
-    """Validate the whole document so a typo fails closed instead of failing open."""
-    if not isinstance(doc, dict):
-        raise PolicyError("policy root must be a JSON object")
-
-    users = doc.get("synthetic_users")
-    if not isinstance(users, dict) or not users:
-        raise PolicyError('"synthetic_users" must be a non-empty JSON object')
-
-    for user, resources in users.items():
-        if not isinstance(resources, dict):
-            raise PolicyError(f"synthetic_users[{user!r}] must be an object of resources")
-        for resource, actions in resources.items():
-            if not isinstance(actions, dict):
-                raise PolicyError(
-                    f"synthetic_users[{user!r}][{resource!r}] must be an object of actions"
-                )
-            for action, allowed in actions.items():
-                _require_bool(allowed, f"synthetic_users[{user!r}][{resource!r}][{action!r}]")
-
-    return doc
-
-
-def load_policy() -> dict:
-    """Reload and validate policy.json on every request so edits apply without a restart."""
-    try:
-        with open(POLICY_PATH) as f:
-            doc = json.load(f)
-    except FileNotFoundError as e:
-        raise PolicyError(f"policy file not found: {POLICY_PATH}") from e
-    except json.JSONDecodeError as e:
-        raise PolicyError(f"policy file is not valid JSON: {e}") from e
-    return validate_policy(doc)
+def load_policy(path: Path | str | None = None) -> dict:
+    return _load_policy(path or POLICY_PATH)
 
 
 def log_decision(
@@ -123,73 +67,112 @@ def log_decision(
     reason: str,
     method: str,
 ) -> None:
-    entry = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "agent": agent_id,
-        "user": user_id,
-        "resource": resource,
-        "action": action,
-        "method": method,
-        "decision": decision,
-        "reason": reason,
-    }
-    with _audit_lock:
-        with open(AUDIT_LOG_PATH, "a") as f:
-            f.write(json.dumps(entry) + "\n")
-    print(f"{'✅ ALLOW' if decision == 'ALLOW' else '🚫 DENY'}: "
-          f"agent={agent_id} user={user_id} resource={resource} action={action} "
-          f"method={method} reason={reason}")
-
-
-def check_permission(
-    user_id: str, resource: str, action: str, policy: dict
-) -> tuple[bool, dict | None, str]:
-    """
-    Returns (is_allowed, user_policy, reason).
-    user_policy is None if the synthetic user doesn't exist in policy.json.
-    Unknown resources/actions for a known user default to DENY (fail-closed).
-    `reason` is a stable, machine-readable code for the audit log.
-    """
-    user_policy = policy["synthetic_users"].get(user_id)
-    if user_policy is None:
-        return False, None, "UNKNOWN_USER"
-    resource_policy = user_policy.get(resource)
-    if resource_policy is None:
-        return False, user_policy, "UNKNOWN_RESOURCE"
-    if action not in resource_policy:
-        return False, user_policy, "UNKNOWN_ACTION"
-    allowed = _require_bool(
-        resource_policy[action], f"synthetic_users[{user_id!r}][{resource!r}][{action!r}]"
+    _log_decision(
+        agent_id,
+        user_id,
+        resource,
+        action,
+        decision,
+        reason=reason,
+        method=method,
+        audit_log_path=AUDIT_LOG_PATH,
     )
-    return allowed, user_policy, "POLICY_ALLOW" if allowed else "POLICY_DENY"
 
 
-def clean_agent_id(request: Request) -> str:
-    """Bound and sanitize caller-supplied attribution; prefer the X-Agent-Id header."""
-    raw = request.headers.get("x-agent-id") or request.query_params.get("agent_id") or "unknown"
-    return _CONTROL_CHARS.sub("", raw)[:MAX_AGENT_ID_LEN] or "unknown"
+app = FastAPI(title="Agent Guardrail")
+
+cors_origins_env = os.getenv("AGENT_GUARDRAIL_CORS_ORIGINS")
+allowed_origins = (
+    [o.strip() for o in cors_origins_env.split(",") if o.strip()]
+    if cors_origins_env
+    else ["*"]
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allowed_origins,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.exception_handler(PolicyError)
+async def policy_error_handler(request: Request, exc: PolicyError):
+    agent_id = clean_agent_id(request)
+    method = request.method.upper()
+    log_decision(
+        agent_id,
+        "unknown",
+        "unknown",
+        "unknown",
+        "DENY",
+        reason=f"POLICY_ERROR: {exc}",
+        method=method,
+    )
+    return JSONResponse(
+        status_code=503,
+        content={"detail": f"Guardrail policy is invalid; see audit.jsonl ({exc})"},
+    )
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail},
+        headers=exc.headers,
+    )
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """
+    P0-4 safety net: No decision path may produce an unhandled, unaudited 500.
+    Every unexpected exception is audited with INTERNAL_ERROR before returning 500.
+    """
+    agent_id = clean_agent_id(request)
+    method = request.method.upper()
+    log_decision(
+        agent_id,
+        "unknown",
+        "unknown",
+        "unknown",
+        "DENY",
+        reason=f"INTERNAL_ERROR: {exc}",
+        method=method,
+    )
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error; see audit.jsonl"},
+    )
 
 
 @app.api_route("/api/{resource}/{user_id}/{action}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
-async def check_and_simulate(resource: str, user_id: str, action: str, request: Request):
+def check_and_simulate(resource: str, user_id: str, action: str, request: Request):
     agent_id = clean_agent_id(request)
     method = request.method.upper()
 
-    # A broken policy denies everything loudly instead of returning a bare 500.
     try:
         policy = load_policy()
-        allowed, user_policy, reason = check_permission(user_id, resource, action, policy)
+        allowed, user_policy, reason = check_permission(
+            user_id, resource, action, policy, method=method
+        )
     except PolicyError as e:
         log_decision(
-            agent_id, user_id, resource, action, "DENY",
-            reason=f"POLICY_ERROR: {e}", method=method,
+            agent_id,
+            user_id,
+            resource,
+            action,
+            "DENY",
+            reason=f"POLICY_ERROR: {e}",
+            method=method,
         )
         raise HTTPException(
             status_code=503, detail="Guardrail policy is invalid; see audit.jsonl"
         )
 
     decision = "ALLOW" if allowed else "DENY"
-    # Log every outcome, including the unknown-user 404 below, before raising.
+    # Log every outcome, including unknown-user 404, before raising.
     log_decision(agent_id, user_id, resource, action, decision, reason=reason, method=method)
 
     if user_policy is None:
@@ -198,7 +181,6 @@ async def check_and_simulate(resource: str, user_id: str, action: str, request: 
     if not allowed:
         raise HTTPException(status_code=403, detail="Access denied by sandbox policy")
 
-    # Simulated success — never real data, just proof the call was authorized
     return {
         "user": user_id,
         "resource": resource,
@@ -208,7 +190,7 @@ async def check_and_simulate(resource: str, user_id: str, action: str, request: 
 
 
 @app.get("/healthz")
-async def healthz():
+def healthz():
     try:
         load_policy()
     except PolicyError as e:
@@ -218,4 +200,4 @@ async def healthz():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    uvicorn.run(app, host=HOST, port=PORT)

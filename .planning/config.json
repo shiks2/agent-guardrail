@@ -1,0 +1,7 @@
+{
+  "mode": "standard",
+  "branching": "trunk",
+  "intel": {
+    "enabled": true
+  }
+}
