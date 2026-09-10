@@ -9,6 +9,10 @@ code changes needed to model a new API. Point your agent at this instead
 of production, and it gets a 200 or 403 back based on the synthetic user's
 policy, with every decision logged to audit.jsonl.
 
+Policy values must be JSON booleans. A quoted `"false"` is rejected at load time
+rather than silently treated as truthy, and an invalid policy fails closed with a
+503 instead of a 500.
+
 Example policy.json:
     {
       "synthetic_users": {
@@ -56,10 +60,52 @@ PORT = int(os.getenv("AGENT_GUARDRAIL_PORT", 8080))
 _audit_lock = threading.Lock()
 
 
+class PolicyError(Exception):
+    """policy.json is structurally invalid. Requests fail closed (503), never allow."""
+
+
+def _require_bool(value: object, path: str) -> bool:
+    """Accept only real JSON booleans. bool subclasses int, hence the exact check."""
+    if type(value) is not bool:
+        raise PolicyError(
+            f"{path} must be a JSON boolean (true/false), got {type(value).__name__}={value!r}"
+        )
+    return value
+
+
+def validate_policy(doc: object) -> dict:
+    """Validate the whole document so a typo fails closed instead of failing open."""
+    if not isinstance(doc, dict):
+        raise PolicyError("policy root must be a JSON object")
+
+    users = doc.get("synthetic_users")
+    if not isinstance(users, dict) or not users:
+        raise PolicyError('"synthetic_users" must be a non-empty JSON object')
+
+    for user, resources in users.items():
+        if not isinstance(resources, dict):
+            raise PolicyError(f"synthetic_users[{user!r}] must be an object of resources")
+        for resource, actions in resources.items():
+            if not isinstance(actions, dict):
+                raise PolicyError(
+                    f"synthetic_users[{user!r}][{resource!r}] must be an object of actions"
+                )
+            for action, allowed in actions.items():
+                _require_bool(allowed, f"synthetic_users[{user!r}][{resource!r}][{action!r}]")
+
+    return doc
+
+
 def load_policy() -> dict:
-    """Reload policy.json on every request so edits take effect without a restart."""
-    with open(POLICY_PATH) as f:
-        return json.load(f)
+    """Reload and validate policy.json on every request so edits apply without a restart."""
+    try:
+        with open(POLICY_PATH) as f:
+            doc = json.load(f)
+    except FileNotFoundError as e:
+        raise PolicyError(f"policy file not found: {POLICY_PATH}") from e
+    except json.JSONDecodeError as e:
+        raise PolicyError(f"policy file is not valid JSON: {e}") from e
+    return validate_policy(doc)
 
 
 def log_decision(agent_id: str, user_id: str, resource: str, action: str, decision: str) -> None:
@@ -97,7 +143,14 @@ def check_permission(user_id: str, resource: str, action: str) -> tuple[bool, di
 async def check_and_simulate(resource: str, user_id: str, action: str, request: Request):
     agent_id = request.query_params.get("agent_id", "unknown")
 
-    allowed, user_policy = check_permission(user_id, resource, action)
+    # A broken policy denies everything loudly instead of returning a bare 500.
+    try:
+        allowed, user_policy = check_permission(user_id, resource, action)
+    except PolicyError:
+        log_decision(agent_id, user_id, resource, action, "DENY")
+        raise HTTPException(
+            status_code=503, detail="Guardrail policy is invalid; see audit.jsonl"
+        )
 
     if user_policy is None:
         raise HTTPException(status_code=404, detail=f"No such synthetic user: {user_id}")
@@ -119,6 +172,10 @@ async def check_and_simulate(resource: str, user_id: str, action: str, request: 
 
 @app.get("/healthz")
 async def healthz():
+    try:
+        load_policy()
+    except PolicyError as e:
+        return {"status": "policy_error", "detail": str(e)}
     return {"status": "ok"}
 
 
